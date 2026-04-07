@@ -3,39 +3,54 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 
 const PLAYER_RADIUS = 20;
 
+interface Player {
+    id: string;
+    x: number;
+    y: number;
+    path: { x: number; y: number }[];
+    actionType: string;
+    attachedTo?: string | null;
+}
+
 export default function SmartClipboard() {
     const canvasRef = useRef<HTMLCanvasElement>(null);
     // Initialize 5 players in a standard "3-out 2-in" formation 
-    const [players, setPlayers] = useState([
-        { id: 'PG', x: 400, y: 480, path: [] as { x: number, y: number }[], actionType: 'MOVE' },
+    const [players, setPlayers] = useState<Player[]>([
+        { id: 'PG', x: 400, y: 480, path: [], actionType: 'MOVE' },
         { id: 'SG', x: 150, y: 400, path: [], actionType: 'MOVE' },
         { id: 'SF', x: 650, y: 400, path: [], actionType: 'MOVE' },
         { id: 'PF', x: 250, y: 150, path: [], actionType: 'MOVE' },
         { id: 'C', x: 550, y: 150, path: [], actionType: 'MOVE' },
-        { id: 'BALL', x: 400, y: 440, path: [], actionType: 'PASS' }, // Added the Ball
+        { id: 'BALL', x: 400, y: 440, path: [], actionType: 'PASS', attachedTo: null }, // Track possession
     ]);
     const [activePlayerIndex, setActivePlayerIndex] = useState<number | null>(null);
     const [analysis, setAnalysis] = useState<any>(null);
     const [isLoading, setIsLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
+    const [isAnimating, setIsAnimating] = useState(false);
+    const [animationPlayers, setAnimationPlayers] = useState<any[]>([]);
+    const animationRef = useRef<number | null>(null);
 
     useEffect(() => {
         const canvas = canvasRef.current;
         const ctx = canvas?.getContext('2d');
         if (!ctx) return;
 
+        // Determine which set of players to draw
+        const drawList = isAnimating ? animationPlayers : players;
+
         // 1. Clear and Draw Court
         drawCourt(ctx);
 
-        // 2. Draw all Ghost Trails
+        // 2. Draw all Ghost Trails (only if not animating or if we want to see them below)
         players.forEach(p => {
             if (p.path.length > 1) drawTrail(ctx, p.path, p.id === 'BALL', p.actionType === 'SCREEN');
         });
 
-        // 3. Draw all Players
-        players.forEach(p => drawPlayer(ctx, p));
+        // 3. Draw all Players (Regular or Animated)
+        drawList.forEach(p => drawPlayer(ctx, p));
 
-    }, [players]);
+    }, [players, isAnimating, animationPlayers]);
 
     const drawCourt = (ctx: CanvasRenderingContext2D) => {
         ctx.clearRect(0, 0, 800, 600);
@@ -61,7 +76,7 @@ export default function SmartClipboard() {
             ctx.setLineDash([]);
             ctx.strokeStyle = "rgba(59, 130, 246, 0.4)";
         }
-        
+
         ctx.lineWidth = 2;
         ctx.moveTo(path[0].x, path[0].y);
         path.forEach(pt => ctx.lineTo(pt.x, pt.y));
@@ -90,14 +105,14 @@ export default function SmartClipboard() {
                 ctx.stroke();
             }
         }
-        
+
         ctx.setLineDash([]);
     };
 
     const drawPlayer = (ctx: CanvasRenderingContext2D, player: any) => {
         const isBall = player.id === 'BALL';
         const radius = isBall ? 10 : PLAYER_RADIUS;
-        
+
         ctx.beginPath();
         ctx.arc(player.x, player.y, radius, 0, Math.PI * 2);
         ctx.fillStyle = isBall ? "#f97316" : "#3b82f6"; // Orange for ball
@@ -105,7 +120,7 @@ export default function SmartClipboard() {
         ctx.strokeStyle = "white";
         ctx.lineWidth = 2;
         ctx.stroke();
-        
+
         if (!isBall) {
             ctx.fillStyle = "white";
             ctx.font = "bold 12px Sans-Serif";
@@ -119,10 +134,12 @@ export default function SmartClipboard() {
             // Only export players who actually moved 
             if (player.path.length < 2) return null;
 
+            const ball = players.find(p => p.id === 'BALL');
             const snapped = snapToFivePoints(player.path);
             return {
                 id: player.id,
                 action: player.actionType,
+                hasBall: ball?.attachedTo === player.id,
                 start_pos: { x: player.path[0].x, y: player.path[0].y },
                 end_pos: { x: player.x, y: player.y },
                 motion_path: snapped
@@ -146,14 +163,27 @@ export default function SmartClipboard() {
             if (!apiKey) throw new Error("API Key missing");
 
             const genAI = new GoogleGenerativeAI(apiKey);
-            const model = genAI.getGenerativeModel({ 
+            const model = genAI.getGenerativeModel({
                 model: "gemini-flash-latest",
                 generationConfig: { responseMimeType: "application/json" }
             });
 
             const prompt = `
-                Expert Basketball Coach. Analyze this play data and return JSON:
-                { "playName": "name", "coachAnalysis": "2 sentences", "steps": ["step1", "step2"], "reanimationData": null }
+                Expert Basketball Coach. Analyze this play data and return STRICT JSON:
+                { 
+                    "playName": "name", 
+                    "coachAnalysis": "2 sentences", 
+                    "steps": ["step1", "step2"], 
+                    "reanimationData": {
+                        "playerSequences": [
+                            { "id": "PG", "path": [{ "x": 0, "y": 0, "t": 0.0 }, { "x": 100, "y": 100, "t": 1.0 }] }
+                        ]
+                    }
+                }
+                
+                Note: For each path point, include a 't' property (0.0 to 1.0) representing the tactical timing.
+                Synchronize moves: e.g., screeners arrive at their spot BEFORE cutters start their route.
+                
                 Play Data: ${jsonString}
             `;
 
@@ -171,7 +201,60 @@ export default function SmartClipboard() {
         }
     };
 
+    const startPlayback = () => {
+        if (!analysis?.reanimationData?.playerSequences) return;
+        setIsAnimating(true);
+        const duration = 3000; // 3 seconds
+        const startTime = performance.now();
+
+        const animate = (time: number) => {
+            const elapsed = time - startTime;
+            const progress = Math.min(elapsed / duration, 1);
+
+            const currentFramePositions = analysis.reanimationData.playerSequences.map((seq: any) => {
+                const path = seq.path;
+                if (!path || path.length === 0) return { id: seq.id, x: 0, y: 0 };
+                if (path.length === 1) return { id: seq.id, x: path[0].x, y: path[0].y };
+
+                // Find the two points in the AI-provided path that bracket the current 'progress'
+                let p1 = path[0];
+                let p2 = path[path.length - 1];
+
+                for (let i = 0; i < path.length - 1; i++) {
+                    if (progress >= path[i].t && progress <= path[i + 1].t) {
+                        p1 = path[i];
+                        p2 = path[i + 1];
+                        break;
+                    }
+                }
+
+                if (p1 === p2) return { id: seq.id, x: p1.x, y: p1.y };
+
+                // Interpolate based on the 't' values of the two bracketing points
+                const timeDiff = p2.t - p1.t;
+                const subProgress = timeDiff === 0 ? 0 : (progress - p1.t) / timeDiff;
+
+                return {
+                    id: seq.id,
+                    x: p1.x + (p2.x - p1.x) * subProgress,
+                    y: p1.y + (p2.y - p1.y) * subProgress
+                };
+            });
+
+            setAnimationPlayers(currentFramePositions);
+
+            if (progress < 1) {
+                animationRef.current = requestAnimationFrame(animate);
+            } else {
+                setTimeout(() => setIsAnimating(false), 500); // Small pause at end
+            }
+        };
+
+        animationRef.current = requestAnimationFrame(animate);
+    };
+
     const handleStart = (e: any) => {
+        if (isAnimating) return; // Disable during playback
         const rect = canvasRef.current?.getBoundingClientRect();
         if (!rect) return;
         const x = ('touches' in e) ? e.touches[0].clientX - rect.left : e.nativeEvent.offsetX;
@@ -184,12 +267,28 @@ export default function SmartClipboard() {
 
         if (index !== -1) {
             setActivePlayerIndex(index);
-            // We no longer reset the path here, allowing for persistent trails
-            const newPlayers = [...players];
-            if (newPlayers[index].path.length === 0) {
-                newPlayers[index].path = [{ x, y }];
-                setPlayers(newPlayers);
-            }
+            
+            setPlayers(prev => {
+                const newPlayers = prev.map(p => ({ ...p, path: [...p.path] }));
+                const ball = newPlayers.find(p => p.id === 'BALL');
+                if (!ball) return newPlayers;
+
+                // 1. Possession Check 
+                if (newPlayers[index].id === 'BALL') {
+                    ball.attachedTo = null; // Manual ball move detaches it
+                } else {
+                    const dist = Math.sqrt((x - ball.x) ** 2 + (y - ball.y) ** 2);
+                    if (dist < 50) { // More forgiving pickup radius
+                        ball.attachedTo = newPlayers[index].id;
+                    }
+                }
+
+                // 2. Persistence Check
+                if (newPlayers[index].path.length === 0) {
+                    newPlayers[index].path = [{ x, y }];
+                }
+                return newPlayers;
+            });
         }
     };
 
@@ -200,14 +299,27 @@ export default function SmartClipboard() {
         const x = ('touches' in e) ? e.touches[0].clientX - rect.left : e.nativeEvent.offsetX;
         const y = ('touches' in e) ? e.touches[0].clientY - rect.top : e.nativeEvent.offsetY;
 
-        const newPlayers = [...players];
-        newPlayers[activePlayerIndex] = {
-            ...newPlayers[activePlayerIndex],
-            x,
-            y,
-            path: [...newPlayers[activePlayerIndex].path, { x, y }]
-        };
-        setPlayers(newPlayers);
+        setPlayers(prev => {
+            const newPlayers = prev.map(p => ({ ...p, path: [...p.path] }));
+            const mover = newPlayers[activePlayerIndex];
+
+            // 1. Update Player 
+            mover.x = x;
+            mover.y = y;
+            mover.path.push({ x, y });
+
+            // 2. LOGIC: Dribble Follow
+            const ball = newPlayers.find(p => p.id === 'BALL');
+            if (ball && ball.attachedTo === mover.id) {
+                const bx = x + 18; // Offset for visibility
+                const by = y + 18;
+                ball.x = bx;
+                ball.y = by;
+                ball.path.push({ x: bx, y: by });
+            }
+
+            return newPlayers;
+        });
     };
 
     const handleEnd = () => {
@@ -350,11 +462,24 @@ export default function SmartClipboard() {
                             </div>
 
                             {analysis.reanimationData && (
-                                <div className="pt-4">
-                                    <div className="flex items-center gap-2 text-xs font-semibold text-emerald-600 bg-emerald-50 px-2 py-1 rounded-md w-fit">
+                                <div className="pt-4 border-t border-slate-100 flex items-center justify-between">
+                                    <div className="flex items-center gap-2 text-xs font-semibold text-emerald-600 bg-emerald-50 px-2 py-1 rounded-md">
                                         <div className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></div>
                                         Re-animation data ready
                                     </div>
+                                    <button
+                                        onClick={startPlayback}
+                                        disabled={isAnimating}
+                                        className={`flex items-center gap-2 px-6 py-2 rounded-full font-bold transition-all ${isAnimating
+                                            ? 'bg-slate-100 text-slate-400 cursor-not-allowed'
+                                            : 'bg-emerald-500 hover:bg-emerald-600 text-white shadow-md active:scale-95'
+                                            }`}
+                                    >
+                                        <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+                                            <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM9.555 7.168A1 1 0 008 8v4a1 1 0 001.555.832l3-2a1 1 0 000-1.664l-3-2z" clipRule="evenodd" />
+                                        </svg>
+                                        {isAnimating ? 'Re-animating...' : 'Play Re-animation'}
+                                    </button>
                                 </div>
                             )}
                         </div>
